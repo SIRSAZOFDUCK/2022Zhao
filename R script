@@ -1,0 +1,181 @@
+## Association between prevalent hypertension and markers of socioeconomic deprivation in China, CHARLS 2018 dataset
+## Yunjia Zhao, Saran Shantikumar Aug 2022
+
+## Set up - install packages below if required -------
+
+rm(list=ls())
+
+library(dplyr)
+library(readxl)
+library(caTools)
+library(ROCR) 
+library(caret)
+library(cowplot)
+library(mlbench)
+library(MASS)
+library(pROC)
+theme_set(theme_bw())
+
+# Set working directory
+setwd("C:/Users/sirsa/OneDrive/Desktop/Warwick/MPH/Projects/2021 Supervising/Yunjia/Analysis")
+
+## Link data --------------
+
+#Load csv files
+data1 <- read_excel("data.xlsx",sheet = "Demographic")
+data2 <- read_excel("data.xlsx",sheet = "Health Status")
+data3 <- read_excel("data.xlsx",sheet = "Personal Income")
+
+# Merge
+dataX <- merge(data1, data2, by = "id")
+alldata <- merge(dataX, data3, by = "id")
+
+#Save
+write.csv(alldata, "alldata.csv", row.names = F)
+
+# Extract removed data and save
+a <- data1 %>% full_join(data2, by = "id") %>% full_join(data3, by="id")
+
+excluded <- anti_join(a, alldata, by = c("id" = "id"))
+
+write.csv(excluded, "excluded_data.csv", row.names = F)
+
+## Clean data -------
+
+rm(list=ls())
+
+data <- read.csv("alldata.csv") #19755 data points
+
+summary(data) # sex (NA0),age 18-118 years (NA318), birth year 1949-2000 (NA318), address type (NA309); education (NA 0), HTN status (NA 5246)
+
+data$age_new <- ifelse(!is.na(data$age), data$age <- 2018-data$birth_year, data$age) # If age missing, calculate as 2018 minus birth year
+
+data <- data[data$age_new >= 45, ] 
+
+data <- data %>% select(-c(age, birth_year, hypertension_age, Age)) 
+
+data <- rename(data, age = age_new) #rename age
+
+data <- data %>% mutate(agegroup = case_when(age >= 45  & age <= 54 ~ '1',
+                                             age >= 55  & age <= 64 ~ '2',
+                                             age >= 65  & age <= 74 ~ '3',
+                                             age >= 75 ~ '4')) # cut into age groups
+
+
+# Drop wage variables as lots of missing data, i.e. wage_status (NA4), wage (NA14906), wage_min(NA19696), wage_max(NA19676)
+
+data <- data %>% select(-c(wage, wage_min, wage_max))
+
+# Reassign educational status
+
+data <- data %>% mutate(education_level = case_when(education_level == 1 ~ '1',
+                                                    education_level == 2 ~ '2',
+                                                    education_level == 3 | education_level == 4  ~ '3',
+                                                    education_level == 5 | education_level == 6   ~ '4',
+                                                    education_level == 8 |education_level == 9 |education_level == 10 |education_level == 11 ~ '5')) # cut into age groups
+
+
+# Show distributions
+
+table(data$sex)
+table(data$agegroup)
+table(data$address_type)
+table(data$education_level)
+table(data$wage_status)
+table(data$hypertension_status)
+
+# Filter incomplete data
+
+data.complete <- data[!is.na(data$agegroup)&!is.na(data$age)&!is.na(data$sex)&!is.na(data$address_type)&!is.na(data$education_level)&!is.na(data$wage_status)&!is.na(data$hypertension_status),]
+
+data.removed <- anti_join(data, data.complete, by = c("id" = "id")) # excluded rows (incomplete data)
+
+write.csv(data.complete,"final_data_included.csv", row.names = F)
+write.csv(data.removed,"final_data_excluded.csv", row.names = F)
+
+## Distributions in included vs excluded data ----------------
+
+table(data.complete$sex)
+table(data.complete$agegroup)
+table(data.complete$address_type)
+table(data.complete$education_level)
+table(data.complete$wage_status)
+table(data.complete$hypertension_status)
+
+table(data.removed$sex)
+table(data.removed$agegroup)
+table(data.removed$address_type)
+table(data.removed$education_level)
+table(data.removed$wage_status)
+table(data.removed$hypertension_status)
+
+# Compare distributions between included and excluded data, repeated for each variable
+
+v1 <- as.data.frame(data.complete$hypertension_status) %>% mutate(group = "Included") %>% rename(value = 1)
+v2 <- as.data.frame(data.removed$hypertension_status) %>% mutate(group = "Excluded") %>% rename(value=1)
+v3 <- rbind(v1, v2)
+chisq.test(v3$value, v3$group)
+
+# Univariate distributions of variables by HTN status, repeated for each variable
+
+data.complete %>% group_by(hypertension_status,wage_status) %>% 
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>% 
+  ungroup() %>% 
+  summarise(test_result=chisq.test(hypertension_status, wage_status)$p.value)
+
+
+## LOGISTIC REGRESSION -------------
+
+# Variables as ordinal factors
+dplyr::mutate(data.complete,  
+              agegroup = 
+                dplyr::recode_factor(agegroup,   
+                                     `1`="45-54y", `2`="55-64y",
+                                     `3`="65-74y", `4` = "75+",  
+                                     .ordered = TRUE)) -> data.complete
+
+
+dplyr::mutate(data.complete,  
+              address_type = 
+                dplyr::recode_factor(address_type,   
+                                     `1`="Urban", `2`="Mixed",
+                                     `3`="Rural", `4` = "Special",  
+                                     .ordered = TRUE)) -> data.complete
+
+dplyr::mutate(data.complete,  
+              education_level = 
+                dplyr::recode_factor(education_level,   
+                                     `1`="None formal", `2`="Primary unfinished",
+                                     `3`="Primary finished", `4` = "Secondary", `5` = "Tertiary",  
+                                     .ordered = TRUE)) -> data.complete
+
+dplyr::mutate(data.complete,  
+              hypertension_status = 
+                dplyr::recode_factor(hypertension_status,   
+                                     `1`="Hypertension", `2`="No hypertension",
+                                     .ordered = TRUE)) -> data.complete
+
+dplyr::mutate(data.complete,  
+              sex = 
+                dplyr::recode_factor(sex,   
+                                     `1`="Male", `2`="Female",
+                                     .ordered = TRUE)) -> data.complete
+
+dplyr::mutate(data.complete,  
+              wage_status = 
+                dplyr::recode_factor(wage_status,   
+                                     `1`="Wage", `2`="No wage",
+                                     .ordered = TRUE)) -> data.complete
+
+
+# Logistic regression (reference https://towardsdatascience.com/implementing-binary-logistic-regression-in-r-7d802a9d98fe)
+
+data.complete.lr <- dplyr::select(data.complete, -c(1,6,8)) # drop unrequired variables
+
+logit_1 <- glm(hypertension_status~., family = binomial,data = data.complete.lr)
+summary(logit_1)
+logit_2 <- stepAIC(logit_1) #stepwise LR
+summary(logit_2)
+
+exp(cbind(OR = coef(logit_1), confint(logit_1))) # calculate ORs and 95% CI
